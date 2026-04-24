@@ -8,8 +8,7 @@ Usage:
     python scripts/download_ski2dpose.py           # downloads WebP images (smallest, 86 MB)
     python scripts/download_ski2dpose.py --jpg      # JPG images (352 MB)
     python scripts/download_ski2dpose.py --png      # PNG images (1.67 GB)
-    python scripts/download_ski2dpose.py --videos   # also download source videos (519 MB)
-
+    
 Output layout:
     data/
     ├── frames/
@@ -75,7 +74,6 @@ def main() -> None:
     fmt.add_argument("--webp",   action="store_true", default=True,  help="WebP images — 86 MB  (default)")
     fmt.add_argument("--jpg",    action="store_true", default=False, help="JPG images  — 352 MB")
     fmt.add_argument("--png",    action="store_true", default=False, help="PNG images  — 1.67 GB")
-    p.add_argument("--videos",   action="store_true", help="Also download source videos (519 MB)")
     args = p.parse_args()
 
     # Resolve image format
@@ -114,18 +112,6 @@ def main() -> None:
         url, size = URLS[img_fmt]
         download(url, zip_dest, size)
         extract(zip_dest, FRAMES_DIR)
-
-    # 3. Videos (optional)
-    if args.videos:
-        print(f"\n[3/3] Videos")
-        vid_zip  = FRAMES_DIR / "Videos.zip"
-        vid_dir  = FRAMES_DIR / "Videos"
-        if vid_dir.exists() and any(vid_dir.iterdir()):
-            print(f"  Already exists — skipping ({vid_dir})")
-        else:
-            url, size = URLS["videos"]
-            download(url, vid_zip, size)
-            extract(vid_zip, FRAMES_DIR)
 
     print("\n" + "=" * 55)
     print("  Done!")
