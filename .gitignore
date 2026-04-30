@@ -1,2 +1,9 @@
 data
 .venv
+*/*/__pycache__
+yolo26s-pose.pt
+yolo26s.pt
+yolo_epfl
+.DS_Store
+runs
+checks/skier_detectrion_test.mp4
