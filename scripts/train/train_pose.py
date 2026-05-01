@@ -1,106 +1,37 @@
 """
-train/train_pose.py
-===================
-Fine-tune YOLO26-pose on the EPFL Ski-2DPose dataset (or any COCO-keypoint
-format dataset).
+train_pose.py
+-------------
+Fine-tunes YOLO26s-pose on the EPFL Ski-2DPose dataset for 24-keypoint
+ski pose estimation.
 
-Ski-2DPose has 24 annotated joints.  YOLO26-pose ships pretrained on COCO-17
-keypoints.  This script:
-  1. Converts the Ski-2DPose annotations to COCO-keypoint YAML format.
-  2. Launches YOLO26 pose training via the Ultralytics API.
+Starting from yolo26s-pose.pt (pretrained on COCO 17 keypoints) and
+fine-tuning on the 24-keypoint Ski-2DPose annotations.
 
-Dataset structure expected
---------------------------
-ski2dpose/
-    images/
-        train/  *.jpg|*.png
-        val/    *.jpg|*.png
-    labels/
-        train/  *.txt   (YOLO keypoint format per image)
-        val/    *.txt
-
-YOLO keypoint label format (one line per person):
-    <class> <cx> <cy> <w> <h>  [<kx> <ky> <kv>] x N_KPT
-    all values normalised 0-1, kv ∈ {0=hidden, 1=occluded, 2=visible}
+Note on keypoint count mismatch:
+    COCO pretrained weights have a head for 17 keypoints.
+    Ski-2DPose needs 24.  Ultralytics handles this automatically — when
+    kpt_shape in dataset.yaml differs from the pretrained model it replaces
+    the detection head with a randomly initialised one and keeps the backbone.
+    This means the backbone's rich feature extraction is preserved while the
+    new keypoints are learned from scratch.  A slightly lower LR helps here.
 
 Usage
 -----
-    python train/train_pose.py \
-        --data  data/ski2dpose.yaml \
-        --model yolo26s-pose.pt \
-        --epochs 100 \
-        --imgsz 640 \
-        --batch 16 \
-        --project runs/pose \
-        --name ski_pose_v1
+    python train_pose.py --data yolo_epfl_pose/dataset.yaml
+
+After training, best weights are at:
+    runs/pose/skier_pose_epfl/weights/best.pt
+
+Use in PoseEstimator:
+    est = PoseEstimator(model_path="runs/pose/skier_pose_epfl/weights/best.pt")
 """
 
 import argparse
 from pathlib import Path
-
 from ultralytics import YOLO
 
 
-def train(
-    data:    str,
-    model:   str  = "yolo26s-pose.pt",
-    epochs:  int  = 100,
-    imgsz:   int  = 640,
-    batch:   int  = 16,
-    device:  str  = "",
-    project: str  = "runs/pose",
-    name:    str  = "ski_pose",
-    patience: int = 20,
-    workers: int  = 8,
-    resume:  bool = False,
-    freeze:  int  = 0,
-):
-    """
-    Fine-tune YOLO26-pose.
-
-    Parameters
-    ----------
-    data    : path to dataset YAML
-    model   : YOLO26 pose weights to start from
-    epochs  : total training epochs
-    imgsz   : training image size
-    batch   : batch size (-1 = auto)
-    device  : "" = auto, "cpu", "0", "0,1", …
-    freeze  : number of backbone layers to freeze (0 = train all)
-    """
-    net = YOLO(model)
-
-    net.train(
-        data      = data,
-        epochs    = epochs,
-        imgsz     = imgsz,
-        batch     = batch,
-        device    = device or ("0" if _cuda() else "cpu"),
-        project   = project,
-        name      = name,
-        patience  = patience,
-        workers   = workers,
-        resume    = resume,
-        freeze    = freeze if freeze > 0 else None,
-        # Augmentations well-suited for outdoor snowy scenes
-        hsv_h     = 0.015,
-        hsv_s     = 0.7,
-        hsv_v     = 0.4,
-        degrees   = 5.0,     # small rotation (skiers lean but not much)
-        translate = 0.1,
-        scale     = 0.5,
-        flipud    = 0.0,     # never flip upside-down
-        fliplr    = 0.5,
-        mosaic    = 1.0,
-        close_mosaic = 10,
-        pose      = 12.0,    # pose loss weight (higher = more emphasis on kpts)
-        kobj      = 2.0,     # keypoint objectness loss weight
-    )
-
-    print(f"\nBest weights saved to: {project}/{name}/weights/best.pt")
-
-
-def _cuda() -> bool:
+def _cuda_available():
     try:
         import torch
         return torch.cuda.is_available()
@@ -108,40 +39,89 @@ def _cuda() -> bool:
         return False
 
 
-def _build_parser():
+def main():
     p = argparse.ArgumentParser(
-        description="Fine-tune YOLO26-pose on Ski-2DPose",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Fine-tune YOLO26s-pose on EPFL Ski-2DPose (24 keypoints)"
     )
-    p.add_argument("--data",    required=True, help="Dataset YAML path")
-    p.add_argument("--model",   default="yolo26s-pose.pt")
-    p.add_argument("--epochs",  type=int, default=100)
-    p.add_argument("--imgsz",   type=int, default=640)
-    p.add_argument("--batch",   type=int, default=16)
-    p.add_argument("--device",  default="")
-    p.add_argument("--project", default="runs/pose")
-    p.add_argument("--name",    default="ski_pose")
-    p.add_argument("--patience",type=int, default=20)
-    p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--resume",  action="store_true")
-    p.add_argument("--freeze",  type=int, default=0,
-                   help="Freeze first N backbone layers")
-    return p
+    p.add_argument("--data",     required=True,
+                   help="Path to dataset.yaml from prepare_epfl_pose.py")
+    p.add_argument("--model",    default="yolo26s-pose.pt",
+                   help="Base weights (default: yolo26s-pose.pt)")
+    p.add_argument("--epochs",   type=int,   default=80,
+                   help="Training epochs (default: 80)")
+    p.add_argument("--imgsz",    type=int,   default=384,
+                   help="Input size — must match HRNet convention 384x288. "
+                        "Ultralytics uses square crops so 384 is a good match.")
+    p.add_argument("--batch",    type=int,   default=16,
+                   help="Batch size (reduce to 8 if out of VRAM)")
+    p.add_argument("--device",   default="",
+                   help="cpu | cuda | mps (empty = auto)")
+    p.add_argument("--project",  default="runs/pose")
+    p.add_argument("--name",     default="skier_pose_epfl")
+    p.add_argument("--patience", type=int,   default=20,
+                   help="Early stopping patience (default: 20)")
+    args = p.parse_args()
 
+    data_path = Path(args.data)
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"dataset.yaml not found: {data_path}\n"
+            "Run prepare_epfl_pose.py first."
+        )
 
-if __name__ == "__main__":
-    args = _build_parser().parse_args()
-    train(
-        data     = args.data,
-        model    = args.model,
+    print(f"[INFO] Loading base model: {args.model}")
+    model = YOLO(args.model)
+
+    print(f"[INFO] Starting pose fine-tuning for {args.epochs} epochs …")
+    print(f"[INFO] Image size: {args.imgsz}  Batch: {args.batch}")
+
+    results = model.train(
+        data     = str(data_path),
+        task     = "pose",
         epochs   = args.epochs,
         imgsz    = args.imgsz,
         batch    = args.batch,
-        device   = args.device,
+        device   = args.device or ("cuda" if _cuda_available() else "cpu"),
         project  = args.project,
         name     = args.name,
         patience = args.patience,
-        workers  = args.workers,
-        resume   = args.resume,
-        freeze   = args.freeze,
+
+        # ── Optimiser ─────────────────────────────────────────────────────
+        # Slightly lower LR than detection because the backbone is pretrained
+        # and we don't want to overwrite its features aggressively.
+        optimizer    = "AdamW",
+        lr0          = 5e-4,
+        lrf          = 0.01,
+        weight_decay = 1e-4,
+        warmup_epochs = 5,
+
+        # ── Augmentation ──────────────────────────────────────────────────
+        # Pose estimation is more sensitive to augmentation than detection —
+        # too aggressive and keypoint positions become inconsistent.
+        hsv_h    = 0.010,
+        hsv_s    = 0.4,
+        hsv_v    = 0.3,
+        degrees  = 10.0,    # small rotation — skiers tilt but rarely past ~10°
+        translate = 0.1,
+        scale    = 0.35,
+        fliplr   = 0.5,     # horizontal flip is fine (flip_idx in yaml handles kpt swap)
+        flipud   = 0.0,     # never flip vertically
+        mosaic   = 0.3,     # lower mosaic than detection — avoids cropping keypoints
+        mixup    = 0.0,     # mixup not suitable for pose
+
+        # ── Misc ──────────────────────────────────────────────────────────
+        save_period = 10,
+        val         = True,
+        plots       = True,
+        verbose     = True,
     )
+
+    best_weights = Path(args.project) / args.name / "weights" / "best.pt"
+    print(f"\n[DONE] Pose training complete.")
+    print(f"       Best weights → {best_weights}")
+    print(f"\n       Update PoseEstimator to use fine-tuned weights:")
+    print(f"       est = PoseEstimator(model_path='{best_weights}')")
+
+
+if __name__ == "__main__":
+    main()

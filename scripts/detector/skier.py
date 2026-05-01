@@ -24,7 +24,8 @@ from ultralytics import YOLO
 
 BBox = Tuple[int, int, int, int]   # (x1, y1, x2, y2)
 
-DEFAULT_MODEL   = "yolo26s.pt"
+# DEFAULT_MODEL   = "yolo26s.pt"
+DEFAULT_MODEL ="runs/detect/runs/detect/skier_epfl/weights/best.pt"
 PERSON_CLASS    = 0          # COCO index for "person"
 IOU_THRESHOLD   = 0.25       # min IoU to accept a detection as the same skier
 MAX_COAST_FRAMES = 10        # frames we keep predicting without a detection

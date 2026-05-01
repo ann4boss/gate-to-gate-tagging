@@ -6,4 +6,6 @@ yolo26s.pt
 yolo_epfl
 .DS_Store
 runs
-checks/skier_detectrion_test.mp4
+checks/*.mp4
+gates/samples
+yolo_epfl_pose
