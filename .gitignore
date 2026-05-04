@@ -7,5 +7,10 @@ yolo_epfl
 .DS_Store
 runs
 checks/*.mp4
+checks/*.jpg
 gates/samples
 yolo_epfl_pose
+yolo_gate_poles
+/out
+/debug_proximity
+/gates

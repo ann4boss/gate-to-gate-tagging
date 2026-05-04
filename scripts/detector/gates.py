@@ -1,158 +1,319 @@
 """
 detector/gates.py
 -----------------
-Detects red and blue slalom / GS gate poles in each frame using HSV colour
-segmentation, then tracks each gate across frames with a simple Kalman filter.
+Detects gate poles in each frame using a fine-tuned YOLO26 model,
+then tracks each pole across frames with a Kalman filter.
 
-Returns a dict  {gate_id: (cx, cy)}  per frame.
+
+Classes detected:
+    0  gate_contact  — the pole the skier hits (GS inner pole or SL panel)
+    1  gate_outer    — the outer rigid pole of a GS gate (GS only)
+
+Each detected pole is tracked across frames using a constant-velocity
+Kalman filter with greedy IoU-based matching — the same approach used
+in the skier detector.  This gives stable pole IDs across frames even
+when the pole is briefly occluded or YOLO misses a frame.
+
+Output per frame:
+    {
+        gate_id: {
+            "cx":    int,           # centroid x in original frame coords
+            "cy":    int,           # centroid y in original frame coords
+            "bbox":  (x1,y1,x2,y2),# bounding box
+            "class": int,           # 0=gate_contact, 1=gate_outer
+            "label": str,           # "gate_contact" or "gate_outer"
+            "conf":  float,         # YOLO detection confidence
+        }
+    }
+
+Usage
+-----
+    det = GateDetector("runs/detect/gate_poles/weights/best.pt")
+    for frame in frames:
+        gates = det.update(frame)
+        for gid, info in gates.items():
+            cx, cy = info["cx"], info["cy"]
+            label  = info["label"]
 """
 
-import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from ultralytics import YOLO
 
-# ── HSV colour ranges ─────────────────────────────────────────────────────────
-# Red wraps around 0° so we need two intervals.
-RED_LOWER1 = np.array([0,   130, 60],  dtype=np.uint8)
-RED_UPPER1 = np.array([10,  255, 255], dtype=np.uint8)
-RED_LOWER2 = np.array([165, 130, 60],  dtype=np.uint8)
-RED_UPPER2 = np.array([180, 255, 255], dtype=np.uint8)
+# ── Class definitions ─────────────────────────────────────────────────────────
+CLASS_NAMES   = {0: "gate_contact", 1: "gate_outer"}
+CLASS_CONTACT = 0
+CLASS_OUTER   = 1
 
-BLUE_LOWER = np.array([95,  120, 60],  dtype=np.uint8)
-BLUE_UPPER = np.array([135, 255, 255], dtype=np.uint8)
-
-# ── Tunable constants ─────────────────────────────────────────────────────────
-MIN_AREA_PX   = 150    # minimum contour area to be a pole candidate
-MAX_AREA_PX   = 15000  # ignore very large blobs (background noise)
-MATCH_DIST_PX = 90     # max pixel distance for Kalman nearest-neighbour match
-MAX_MISSING   = 10     # frames a tracker can be unseen before being dropped
+# ── Tracker constants ─────────────────────────────────────────────────────────
+IOU_THRESHOLD  = 0.15   # lower than skier because poles are small thin objects
+MAX_MISSING    = 60     # frames a tracker survives without a detection
+DEFAULT_MODEL  = "runs/detect/gate_poles/weights/best.pt"
 
 
-@dataclass
-class _GateTracker:
-    gate_id: str
-    color:   str          # "R" or "B"
-    kf:      cv2.KalmanFilter
-    missed:  int = 0
-    last_cx: float = 0.0
-    last_cy: float = 0.0
+# ── Kalman filter (4-state: cx, cy, vx, vy) ──────────────────────────────────
 
-
-def _make_kalman(cx: float, cy: float) -> cv2.KalmanFilter:
-    """Constant-velocity Kalman filter (state: x, y, vx, vy; meas: x, y)."""
+def _make_kalman(cx: float, cy: float):
+    import cv2
     kf = cv2.KalmanFilter(4, 2)
     kf.measurementMatrix  = np.eye(2, 4, dtype=np.float32)
     kf.transitionMatrix   = np.array(
-        [[1, 0, 1, 0],
-         [0, 1, 0, 1],
-         [0, 0, 1, 0],
-         [0, 0, 0, 1]], dtype=np.float32)
+        [[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=np.float32
+    )
     kf.processNoiseCov    = np.eye(4, dtype=np.float32) * 1e-2
     kf.measurementNoiseCov= np.eye(2, dtype=np.float32) * 5e-1
-    kf.statePre           = np.array([[cx], [cy], [0.], [0.]], dtype=np.float32)
-    kf.statePost          = kf.statePre.copy()
-    kf.errorCovPre        = np.eye(4, dtype=np.float32)
+    kf.statePre  = np.array([[cx],[cy],[0.],[0.]], dtype=np.float32)
+    kf.statePost = kf.statePre.copy()
+    kf.errorCovPre = np.eye(4, dtype=np.float32)
     return kf
 
 
+# ── Geometry helpers ──────────────────────────────────────────────────────────
+
+def _bbox_centre(bbox):
+    x1, y1, x2, y2 = bbox
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def _iou(a, b) -> float:
+    ax1,ay1,ax2,ay2 = a
+    bx1,by1,bx2,by2 = b
+    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+    if inter == 0:
+        return 0.0
+    return inter / ((ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter)
+
+
+def _predicted_bbox(kf, last_w: float, last_h: float):
+    """Return a bbox from Kalman prediction using last known width/height."""
+    pred = kf.predict()
+    cx, cy = pred[0,0], pred[1,0]
+    return (
+        int(cx - last_w/2), int(cy - last_h/2),
+        int(cx + last_w/2), int(cy + last_h/2),
+    )
+
+
+# ── Pole tracker ──────────────────────────────────────────────────────────────
+
+@dataclass
+class _PoleTracker:
+    gate_id: str
+    cls:     int          # 0=gate_contact, 1=gate_outer
+    kf:      object       # cv2.KalmanFilter
+    last_cx: float
+    last_cy: float
+    last_w:  float
+    last_h:  float
+    last_conf: float
+    missed:  int = 0
+
+
+# ── Main class ────────────────────────────────────────────────────────────────
+
 class GateDetector:
     """
-    Stateful detector that keeps Kalman-tracked identities across frames.
+    YOLO26-based gate pole detector with Kalman filter tracking.
 
-    Usage:
-        det = GateDetector()
-        for frame in frames:
-            gate_centroids = det.update(frame)   # {gate_id: (cx, cy)}
+    Parameters
+    ----------
+    model_path : str
+        Path to fine-tuned YOLO26 weights from train_gate_detector.py.
+    conf : float
+        YOLO detection confidence threshold.
+    device : str
+        'cpu', 'cuda', 'mps', or '' (auto).
+    iou_threshold : float
+        Minimum IoU to match a detection to an existing track.
+    max_missing : int
+        Frames a track survives without a matching detection.
+    contact_only : bool
+        If True, only return gate_contact poles (class 0).
+        Useful for feature vector computation where gate_outer is not needed.
     """
 
-    def __init__(self):
-        self._trackers: Dict[str, _GateTracker] = {}
-        self._next_id  = 0
+    def __init__(
+        self,
+        model_path:    str   = DEFAULT_MODEL,
+        conf:          float = 0.35,
+        device:        str   = "",
+        iou_threshold: float = IOU_THRESHOLD,
+        max_missing:   int   = MAX_MISSING,
+        contact_only:  bool  = False,
+    ):
+        self.model         = YOLO(model_path)
+        self.conf          = conf
+        self.device        = device or ("cuda" if self._cuda_available() else "cpu")
+        self.iou_threshold = iou_threshold
+        self.max_missing   = max_missing
+        self.contact_only  = contact_only
+
+        self._trackers: Dict[str, _PoleTracker] = {}
+        self._next_id = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(self, frame: np.ndarray) -> Dict[str, Tuple[int, int]]:
+    def update(self, frame: np.ndarray) -> Dict[str, dict]:
         """
         Process one BGR frame.
 
         Returns
         -------
-        dict  {gate_id: (cx_px, cy_px)}
+        dict keyed by gate_id, each value:
+            {"cx", "cy", "bbox", "class", "label", "conf"}
+        Only includes poles whose track is currently active.
         """
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        detections = self._run_yolo(frame)
 
-        red_mask  = (cv2.inRange(hsv, RED_LOWER1, RED_UPPER1)
-                   | cv2.inRange(hsv, RED_LOWER2, RED_UPPER2))
-        blue_mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
+        # Filter to contact-only if requested
+        if self.contact_only:
+            detections = [d for d in detections if d["class"] == CLASS_CONTACT]
 
-        detections: List[Tuple[float, float, str]] = []  # (cx, cy, color)
-        for mask, color in [(red_mask, "R"), (blue_mask, "B")]:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                                    np.ones((5, 5), np.uint8))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                                    np.ones((9, 9), np.uint8))
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-            for c in cnts:
-                area = cv2.contourArea(c)
-                if not (MIN_AREA_PX <= area <= MAX_AREA_PX):
-                    continue
-                M = cv2.moments(c)
-                if M["m00"] == 0:
-                    continue
-                cx = M["m10"] / M["m00"]
-                cy = M["m01"] / M["m00"]
-                detections.append((cx, cy, color))
-
-        # Advance Kalman predictions
-        predictions: Dict[str, np.ndarray] = {}
+        # ── Predict next position for all active trackers ─────────────────────
+        predictions = {}
         for gid, trk in self._trackers.items():
-            pred = trk.kf.predict()   # shape (4,1)
-            predictions[gid] = pred[:2].flatten()
+            predictions[gid] = _predicted_bbox(trk.kf, trk.last_w, trk.last_h)
 
-        # Greedy nearest-neighbour matching (same color only)
+        # ── Greedy IoU matching ───────────────────────────────────────────────
         matched_det_idxs: set = set()
         matched_trk_ids:  set = set()
+
         for gid, trk in self._trackers.items():
-            pred_xy = predictions[gid]
-            best_dist, best_i = MATCH_DIST_PX, -1
-            for i, (cx, cy, col) in enumerate(detections):
-                if col != trk.color or i in matched_det_idxs:
+            pred_bbox  = predictions[gid]
+            best_iou   = self.iou_threshold
+            best_i     = -1
+
+            for i, det in enumerate(detections):
+                if i in matched_det_idxs:
                     continue
-                d = float(np.linalg.norm([cx - pred_xy[0], cy - pred_xy[1]]))
-                if d < best_dist:
-                    best_dist, best_i = d, i
+                # Only match same class
+                if det["class"] != trk.cls:
+                    continue
+                iou = _iou(pred_bbox, det["bbox"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_i   = i
+
             if best_i >= 0:
-                cx, cy, _ = detections[best_i]
-                trk.kf.correct(np.array([[cx], [cy]], dtype=np.float32))
-                trk.last_cx = cx
-                trk.last_cy = cy
-                trk.missed  = 0
+                det = detections[best_i]
+                cx, cy = _bbox_centre(det["bbox"])
+                x1,y1,x2,y2 = det["bbox"]
+                trk.kf.correct(np.array([[cx],[cy]], dtype=np.float32))
+                trk.last_cx   = cx
+                trk.last_cy   = cy
+                trk.last_w    = float(x2 - x1)
+                trk.last_h    = float(y2 - y1)
+                trk.last_conf = det["conf"]
+                trk.missed    = 0
                 matched_det_idxs.add(best_i)
                 matched_trk_ids.add(gid)
             else:
                 trk.missed += 1
+                # Update position from Kalman prediction
+                pred = predictions[gid]
+                trk.last_cx = (pred[0] + pred[2]) / 2.0
+                trk.last_cy = (pred[1] + pred[3]) / 2.0
 
-        # Spawn new trackers for unmatched detections
-        for i, (cx, cy, col) in enumerate(detections):
+        # ── Spawn new trackers for unmatched detections ───────────────────────
+        for i, det in enumerate(detections):
             if i not in matched_det_idxs:
-                gid = f"{col}{self._next_id}"
+                cx, cy = _bbox_centre(det["bbox"])
+                x1,y1,x2,y2 = det["bbox"]
+                gid = f"{'C' if det['class']==CLASS_CONTACT else 'O'}{self._next_id}"
                 self._next_id += 1
-                self._trackers[gid] = _GateTracker(
-                    gate_id=gid, color=col,
-                    kf=_make_kalman(cx, cy),
-                    last_cx=cx, last_cy=cy)
+                self._trackers[gid] = _PoleTracker(
+                    gate_id   = gid,
+                    cls       = det["class"],
+                    kf        = _make_kalman(cx, cy),
+                    last_cx   = cx,
+                    last_cy   = cy,
+                    last_w    = float(x2 - x1),
+                    last_h    = float(y2 - y1),
+                    last_conf = det["conf"],
+                )
 
-        # Drop stale trackers
+        # ── Drop stale trackers ───────────────────────────────────────────────
         self._trackers = {
             gid: trk for gid, trk in self._trackers.items()
-            if trk.missed <= MAX_MISSING
+            if trk.missed <= self.max_missing
         }
 
-        return {gid: (int(trk.last_cx), int(trk.last_cy))
-                for gid, trk in self._trackers.items()}
+        # ── Build output ──────────────────────────────────────────────────────
+        return {
+            gid: {
+                "cx":    int(trk.last_cx),
+                "cy":    int(trk.last_cy),
+                "bbox":  _predicted_bbox(trk.kf, trk.last_w, trk.last_h),
+                "class": trk.cls,
+                "label": CLASS_NAMES[trk.cls],
+                "conf":  trk.last_conf,
+            }
+            for gid, trk in self._trackers.items()
+        }
 
     def reset(self):
+        """Reset all trackers — call between runs."""
         self._trackers.clear()
         self._next_id = 0
+
+    def contact_poles(self, gates: dict) -> dict:
+        """Filter output of update() to gate_contact poles only."""
+        return {gid: info for gid, info in gates.items()
+                if info["class"] == CLASS_CONTACT}
+
+    def nearest_contact_pole(
+        self,
+        gates: dict,
+        skier_cx: float,
+        skier_cy: float,
+    ) -> Optional[dict]:
+        """
+        Return the gate_contact pole closest to the skier position.
+        Useful for feature vector computation (feature[4], feature[7]).
+        Returns None if no contact poles are tracked.
+        """
+        contacts = self.contact_poles(gates)
+        if not contacts:
+            return None
+        return min(
+            contacts.values(),
+            key=lambda g: (g["cx"] - skier_cx)**2 + (g["cy"] - skier_cy)**2
+        )
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _run_yolo(self, frame: np.ndarray) -> List[dict]:
+        results = self.model(
+            frame,
+            task    = "detect",
+            conf    = self.conf,
+            device  = self.device,
+            verbose = False,
+        )
+        if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+            return []
+
+        out = []
+        boxes = results[0].boxes
+        for i in range(len(boxes)):
+            x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().astype(int)
+            conf  = float(boxes.conf[i])
+            cls   = int(boxes.cls[i])
+            out.append({
+                "bbox":  (int(x1), int(y1), int(x2), int(y2)),
+                "conf":  conf,
+                "class": cls,
+                "label": CLASS_NAMES.get(cls, f"cls_{cls}"),
+            })
+        return out
+
+    @staticmethod
+    def _cuda_available() -> bool:
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
