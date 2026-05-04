@@ -14,3 +14,5 @@ yolo_gate_poles
 /out
 /debug_proximity
 /gates
+/checks/Braathen_pole_segment
+/checks

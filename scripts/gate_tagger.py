@@ -114,47 +114,61 @@ _KP_LEFT_ANKLE      = 15
 _KP_RIGHT_ANKLE     = 16
 _KP_LEFT_POLE_GRIP  = 19
 _KP_RIGHT_POLE_GRIP = 22
-def _closest_hand_to_gate(kpts: list, gate_cx: float, gate_cy: float):
-    # Return (x, y) of the hand keypoint closest to the given gate centroid.
-    # Priority: pole grips (kpts 19, 22) from fine-tuned model first,
-    # then wrists (kpts 9, 10) as fallback.
-    # Picks left or right based on which is closer to the gate pole.
+
+def _point_to_vertical_segment_distance(px: float, py: float, bbox) -> float:
+    """
+    Distance from a point to the visible gate-pole segment.
+
+    The gate bbox is approximated as a vertical pole line:
+        x = center of bbox
+        y from bbox top to bbox bottom
+    """
+    x1, y1, x2, y2 = bbox
+
+    pole_x = (x1 + x2) / 2.0
+    closest_y = min(max(py, y1), y2)
+
+    return ((px - pole_x) ** 2 + (py - closest_y) ** 2) ** 0.5
+
+
+def _closest_hand_to_pole(kpts: list, gate_bbox):
+    """
+    Return (x, y) of the hand / pole-grip keypoint closest to the gate pole.
+
+    Priority:
+    1. Ski-specific pole grips, if using the 24-kpt model.
+    2. Wrists, as fallback.
+    """
     if not kpts:
         return None
- 
-    def _dist(x, y):
-        return ((x - gate_cx) ** 2 + (y - gate_cy) ** 2) ** 0.5
- 
-    # Try pole grips first (24-kpt fine-tuned model only)
+
     grip_candidates = []
+
     for idx in (_KP_LEFT_POLE_GRIP, _KP_RIGHT_POLE_GRIP):
         if idx < len(kpts):
             x, y, c = kpts[idx]
             if c > 0:
-                grip_candidates.append((x, y, _dist(x, y)))
+                d = _point_to_vertical_segment_distance(x, y, gate_bbox)
+                grip_candidates.append((x, y, d))
+
     if grip_candidates:
         best = min(grip_candidates, key=lambda t: t[2])
-        return (best[0], best[1])
- 
-    # Fall back to wrists only
+        return best[0], best[1]
+
     wrist_candidates = []
+
     for idx in (_KP_LEFT_WRIST, _KP_RIGHT_WRIST):
         if idx < len(kpts):
             x, y, c = kpts[idx]
             if c > 0:
-                wrist_candidates.append((x, y, _dist(x, y)))
+                d = _point_to_vertical_segment_distance(x, y, gate_bbox)
+                wrist_candidates.append((x, y, d))
+
     if wrist_candidates:
         best = min(wrist_candidates, key=lambda t: t[2])
-        return (best[0], best[1])
- 
+        return best[0], best[1]
+
     return None
- 
- 
- 
- 
-def _best_hand_position(kpts: list, gate_cx: float = 0.0, gate_cy: float = 0.0):
-    # Wrapper — picks the hand closest to the given gate position.
-    return _closest_hand_to_gate(kpts, gate_cx, gate_cy)
  
  
 def _ankle_midpoint(kpts: list):
@@ -172,37 +186,35 @@ def _ankle_midpoint(kpts: list):
     return ((xl + xr) / 2.0, (yl + yr) / 2.0)
  
  
-def _combined_distance(kpts: list, gate_cx: float, gate_cy: float):
-    # Compute a combined distance signal from hand + ankle to the gate pole.
-    #
-    # We use a weighted combination:
-    #   - Hand/grip distance (weight 0.7): primary signal — directly measures
-    #     pole contact. Noisier because wrists/grips are small and sometimes
-    #     occluded, but strongly indicates the passage moment.
-    #   - Ankle midpoint distance (weight 0.3): secondary signal — ankles are
-    #     large, stable, and consistently detected. They reach a minimum as the
-    #     skier's feet pass the pole, slightly after hand contact.
-    #
-    # If only one signal is available, use it alone (weight = 1.0).
-    # Returns None if neither signal is available.
- 
-    hand   = _closest_hand_to_gate(kpts, gate_cx, gate_cy)
-    ankle  = _ankle_midpoint(kpts)
- 
+def _combined_distance_to_pole(kpts: list, gate_bbox):
+    """
+    Compute combined distance from skier keypoints to the actual pole segment.
+
+    Uses:
+    - pole grip / wrist distance as primary signal
+    - ankle midpoint distance as secondary signal
+    """
+    hand = _closest_hand_to_pole(kpts, gate_bbox)
+    ankle = _ankle_midpoint(kpts)
+
     def _dist(pos):
         if pos is None:
             return None
-        return ((pos[0] - gate_cx) ** 2 + (pos[1] - gate_cy) ** 2) ** 0.5
- 
-    d_hand  = _dist(hand)
+
+        return _point_to_vertical_segment_distance(pos[0], pos[1], gate_bbox)
+
+    d_hand = _dist(hand)
     d_ankle = _dist(ankle)
- 
+
     if d_hand is not None and d_ankle is not None:
-        return 0.7 * d_hand + 0.3 * d_ankle
-    elif d_hand is not None:
+        return 0.8 * d_hand + 0.2 * d_ankle
+
+    if d_hand is not None:
         return d_hand
-    elif d_ankle is not None:
+
+    if d_ankle is not None:
         return d_ankle
+
     return None
  
  
@@ -218,6 +230,39 @@ def _hip_midpoint(kpts: list):
     y = (kpts[11][1] + kpts[12][1]) / 2.0
     return x, y
 
+def _filter_contact_gates_near_skier(gates: dict, skier_bbox, margin: int = 120) -> dict:
+    """
+    Keep only contact-gate detections that are spatially plausible for the skier.
+
+    This removes duplicate / far-away / irrelevant gate detections before building
+    the distance signal.
+    """
+    if skier_bbox is None:
+        return {
+            gid: info
+            for gid, info in gates.items()
+            if info["class"] == 0
+        }
+
+    sx1, sy1, sx2, sy2 = skier_bbox
+
+    out = {}
+
+    for gid, info in gates.items():
+        if info["class"] != 0:
+            continue
+
+        x1, y1, x2, y2 = info["bbox"]
+        cx = info["cx"]
+
+        near_x = sx1 - margin <= cx <= sx2 + margin
+        vertical_overlap = not (y2 < sy1 - margin or y1 > sy2 + margin)
+
+        if near_x and vertical_overlap:
+            out[gid] = info
+
+    return out
+
 # ── Core processing ───────────────────────────────────────────────────────────
 
 def process(
@@ -228,10 +273,10 @@ def process(
     gate_model:     str   = "runs/detect/gate_poles/weights/best.pt",
     det_conf:       float = 0.40,
     pose_conf:      float = 0.35,
-    gate_conf:      float = 0.35,
+    gate_conf:      float = 0.45,
     refractory_s:   float = 0.35,
-    sigma:          float = 1.5,
-    min_prominence: float = 8.0,
+    sigma:          float = 2.0,
+    min_prominence: float = 0.06,
     device:         str   = "",
     debug_dir:      Optional[str] = None,
 ) -> dict:
@@ -269,46 +314,55 @@ def process(
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
 
-    # ── Per-frame data collection ─────────────────────────────────────────────
-    # frame_data: list of (frame_idx, keypoints, gate_info_dict)
-    # gate_info_dict: {gate_id: {"cx", "cy", "bbox", "class", "label", "conf"}}
+# ── Per-frame data collection ─────────────────────────────────────────────
+# frame_data: list of (frame_idx, keypoints, filtered_gate_info_dict, skier_bbox)
+# gate_info_dict: {gate_id: {"cx", "cy", "bbox", "class", "label", "conf"}}
     frame_data = []
-    fps_value  = None
+    fps_value = None
 
     with tqdm(desc="Processing frames", unit="frame") as pbar:
-        #skip first 5 seconds and last 5 seconds
-        skip_frames = int(5 * fps_value) if fps_value else 0
-
         for frame_idx, frame, fps, total in frame_source:
+            if fps_value is None:
+                fps_value = fps
+                pbar.total = total
+
+            # Skip first/last 5 seconds after fps is known
+            skip_frames = int(5 * fps_value)
+
             if frame_idx < skip_frames:
                 continue
+
             if skip_frames and total and frame_idx >= total - skip_frames:
                 continue
-            if fps_value is None:
-                fps_value  = fps
-                pbar.total = total
 
             # Step 1: skier bbox
             skier_bbox = skier_det.detect(frame)
 
-            # Step 2: pose keypoints (cropped to skier if available)
+            # Step 2: pose keypoints, cropped to skier if available
             kpts = pose_est.estimate(frame, skier_bbox)
 
             # Step 3: gate poles
-            gates = gate_det.update(frame)
+            gates_all = gate_det.update(frame)
 
-            frame_data.append((frame_idx, kpts, gates))
+            # Step 4: keep only plausible contact gates near the skier
+            gates = _filter_contact_gates_near_skier(
+                gates_all,
+                skier_bbox,
+                margin=120,
+            )
+
+            frame_data.append((frame_idx, kpts, gates, skier_bbox))
 
             if debug_dir:
-                _draw_debug(frame, skier_bbox, kpts, gates,
-                            frame_idx, fps_value, debug_dir)
+                _draw_debug(frame, skier_bbox, kpts, gates, frame_idx, fps_value, debug_dir)
+
             pbar.update(1)
 
     if fps_value is None:
         raise RuntimeError("No frames were processed.")
 
     n_frames       = len(frame_data)
-    unique_gate_ids = sorted({gid for _, _, g in frame_data for gid in g})
+    unique_gate_ids = sorted({gid for _, _, g, _ in frame_data for gid in g})
     print(f"\n[INFO] Processed {n_frames} frames at {fps_value:.2f} fps")
     print(f"[INFO] Unique gate IDs tracked: {unique_gate_ids}")
 
@@ -320,44 +374,72 @@ def process(
     # Instead of passing raw keypoints to compute_distances (which uses all
     # confident keypoints), we pre-compute the combined distance per gate per
     # frame and pass synthetic single-keypoint data so proximity.py works as-is.
-    from logic.proximity import compute_distances as _cd
- 
-    # Build {gate_id: [(frame_idx, dist)]} directly
     from collections import defaultdict
+
+    # Build {gate_id: [(local_idx, original_frame_idx, normalized_dist)]}
     gate_signal_raw = defaultdict(list)
- 
-    for frame_idx, kpts, gates in frame_data:
+
+    for local_idx, item in enumerate(frame_data):
+        frame_idx, kpts, gates, skier_bbox = item
+
         for gid, info in gates.items():
             if info["class"] != 0:
                 continue
-            gcx, gcy = float(info["cx"]), float(info["cy"])
-            dist = _combined_distance(kpts, gcx, gcy)
-            if dist is not None:
-                gate_signal_raw[gid].append((frame_idx, dist))
- 
-    # Convert to the format compute_distances returns: {gate_id: np.array}
-    # indexed by frame, with NaN where no signal exists
-    n_frames   = len(frame_data)
-    signals    = {}
+
+            # Step 1: distance to actual pole segment, not bbox centroid
+            dist_px = _combined_distance_to_pole(kpts, info["bbox"])
+
+            if dist_px is None:
+                continue
+
+            # Step 5: normalize by skier height
+            if skier_bbox is not None:
+                sx1, sy1, sx2, sy2 = skier_bbox
+                skier_h = float(sy2 - sy1)
+                dist = dist_px / max(skier_h, 1.0)
+            else:
+                # Fallback if skier bbox is missing
+                dist = dist_px
+
+            gate_signal_raw[gid].append((local_idx, frame_idx, dist))
+
+    # Convert to {gate_id: np.array}, indexed by local processed-frame index.
+    # This fixes the frame-indexing bug when skipped frames are used.
+    n_frames = len(frame_data)
+    signals = {}
+    frame_lookup = {}
+
     for gid, readings in gate_signal_raw.items():
         arr = np.full(n_frames, np.nan)
-        for frame_idx, dist in readings:
-            if frame_idx < n_frames:
-                arr[frame_idx] = dist
+
+        for local_idx, original_frame_idx, dist in readings:
+            arr[local_idx] = dist
+            frame_lookup[local_idx] = original_frame_idx
+
         signals[gid] = arr
  
     # Fall back to proximity.py if no signals computed (safety net)
     if not signals:
+        print("[WARN] No pole-segment distance signals computed.")
+        print("[WARN] Falling back to proximity.py centroid distance computation.")
+
+        from logic.proximity import compute_distances as _cd
+
         proximity_data = []
-        for frame_idx, kpts, gates in frame_data:
+
+        for local_idx, item in enumerate(frame_data):
+            frame_idx, kpts, gates, skier_bbox = item
+
             contact_centroids = {
                 gid: (info["cx"], info["cy"])
                 for gid, info in gates.items()
                 if info["class"] == 0
             }
-            proximity_data.append((frame_idx, kpts, contact_centroids))
+
+            proximity_data.append((local_idx, kpts, contact_centroids))
+            frame_lookup[local_idx] = frame_idx
+
         signals = _cd(proximity_data)
-        print("[WARN] Falling back to proximity.py distance computation")
     passages = detect_gate_passages(
         signals,
         fps           = fps_value,
@@ -365,6 +447,13 @@ def process(
         sigma         = sigma,
         min_prominence= min_prominence,
     )
+
+    # Event detection runs on local processed-frame indices.
+    # Convert back to original video frame indices for the output JSON.
+    for event in passages:
+        local_frame = int(event["frame"])
+        event["local_frame"] = local_frame
+        event["frame"] = int(frame_lookup.get(local_frame, local_frame))
  
     print(f"[INFO] Gate passages detected: {len(passages)}")
     return build_output(run_id=run_id, fps=fps_value, passages=passages)
@@ -440,15 +529,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── Confidence thresholds ─────────────────────────────────────────────────
     p.add_argument("--det-conf",   type=float, default=0.40)
     p.add_argument("--pose-conf",  type=float, default=0.35)
-    p.add_argument("--gate-conf",  type=float, default=0.35)
+    p.add_argument("--gate-conf",  type=float, default=0.45)
 
     # ── Event detection tuning ────────────────────────────────────────────────
     p.add_argument("--refractory", type=float, default=0.35,
                    help="Min seconds between two passages of the same gate")
-    p.add_argument("--sigma",      type=float, default=2.5,
+    p.add_argument("--sigma",      type=float, default=2.0,
                    help="Gaussian smoothing σ (frames) for distance signal")
-    p.add_argument("--min-prom",   type=float, default=15.0,
-                   help="Min prominence (px) for a valid gate-passage minimum")
+    p.add_argument("--min-prom",   type=float, default=0.06,
+                   help="Min prominence for normalized distance signal; try 0.04–0.08")
 
     p.add_argument("--device",     default="",
                    help="Inference device: cpu | cuda | mps (empty = auto)")

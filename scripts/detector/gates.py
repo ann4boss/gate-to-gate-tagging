@@ -47,7 +47,7 @@ CLASS_CONTACT = 0
 CLASS_OUTER   = 1
 
 # ── Tracker constants ─────────────────────────────────────────────────────────
-IOU_THRESHOLD  = 0.15   # lower than skier because poles are small thin objects
+MATCH_DIST_THRESHOLD = 40.0  # pixels; tune for your video resolution
 MAX_MISSING    = 60     # frames a tracker survives without a detection
 DEFAULT_MODEL  = "runs/detect/gate_poles/weights/best.pt"
 
@@ -75,6 +75,17 @@ def _bbox_centre(bbox):
     x1, y1, x2, y2 = bbox
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
+def _pole_match_distance(pred_bbox, det_bbox) -> float:
+    """
+    Distance between predicted pole and detected pole.
+
+    IoU is unstable for thin vertical poles, so match mostly by pole x-position,
+    with a smaller penalty for y-position.
+    """
+    pcx, pcy = _bbox_centre(pred_bbox)
+    dcx, dcy = _bbox_centre(det_bbox)
+
+    return abs(pcx - dcx) + 0.25 * abs(pcy - dcy)
 
 def _iou(a, b) -> float:
     ax1,ay1,ax2,ay2 = a
@@ -140,14 +151,14 @@ class GateDetector:
         model_path:    str   = DEFAULT_MODEL,
         conf:          float = 0.35,
         device:        str   = "",
-        iou_threshold: float = IOU_THRESHOLD,
+        match_dist_threshold: float = MATCH_DIST_THRESHOLD,
         max_missing:   int   = MAX_MISSING,
         contact_only:  bool  = False,
     ):
         self.model         = YOLO(model_path)
         self.conf          = conf
         self.device        = device or ("cuda" if self._cuda_available() else "cpu")
-        self.iou_threshold = iou_threshold
+        self.match_dist_threshold = match_dist_threshold
         self.max_missing   = max_missing
         self.contact_only  = contact_only
 
@@ -177,41 +188,49 @@ class GateDetector:
         for gid, trk in self._trackers.items():
             predictions[gid] = _predicted_bbox(trk.kf, trk.last_w, trk.last_h)
 
-        # ── Greedy IoU matching ───────────────────────────────────────────────
+        # ── Greedy centre/line-distance matching ──────────────────────────────
         matched_det_idxs: set = set()
-        matched_trk_ids:  set = set()
+        matched_trk_ids: set = set()
 
         for gid, trk in self._trackers.items():
-            pred_bbox  = predictions[gid]
-            best_iou   = self.iou_threshold
-            best_i     = -1
+            pred_bbox = predictions[gid]
+
+            best_cost = self.match_dist_threshold
+            best_i = -1
 
             for i, det in enumerate(detections):
                 if i in matched_det_idxs:
                     continue
+
                 # Only match same class
                 if det["class"] != trk.cls:
                     continue
-                iou = _iou(pred_bbox, det["bbox"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_i   = i
+
+                cost = _pole_match_distance(pred_bbox, det["bbox"])
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_i = i
 
             if best_i >= 0:
                 det = detections[best_i]
                 cx, cy = _bbox_centre(det["bbox"])
-                x1,y1,x2,y2 = det["bbox"]
-                trk.kf.correct(np.array([[cx],[cy]], dtype=np.float32))
-                trk.last_cx   = cx
-                trk.last_cy   = cy
-                trk.last_w    = float(x2 - x1)
-                trk.last_h    = float(y2 - y1)
+                x1, y1, x2, y2 = det["bbox"]
+
+                trk.kf.correct(np.array([[cx], [cy]], dtype=np.float32))
+                trk.last_cx = cx
+                trk.last_cy = cy
+                trk.last_w = float(x2 - x1)
+                trk.last_h = float(y2 - y1)
                 trk.last_conf = det["conf"]
-                trk.missed    = 0
+                trk.missed = 0
+
                 matched_det_idxs.add(best_i)
                 matched_trk_ids.add(gid)
+
             else:
                 trk.missed += 1
+
                 # Update position from Kalman prediction
                 pred = predictions[gid]
                 trk.last_cx = (pred[0] + pred[2]) / 2.0
