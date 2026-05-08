@@ -177,6 +177,28 @@ def skier_cx_from_pose(model: YOLO, frame: np.ndarray, device: str) -> float | N
     return float((x1 + x2) / 2)
 
 
+def deduplicate_events(events: list[dict], fps: float, min_sep_s: float = 0.5) -> list[dict]:
+    """
+    Keep only one event per temporal cluster.
+    Multiple gate IDs firing near the same frame = same physical gate passage.
+    """
+    if not events:
+        return []
+    
+    events = sorted(events, key=lambda e: e["frame"])
+    min_sep_frames = int(min_sep_s * fps)
+    
+    merged = [events[0]]
+    for ev in events[1:]:
+        if ev["frame"] - merged[-1]["frame"] >= min_sep_frames:
+            merged.append(ev)
+        else:
+            # Keep whichever has smaller min_dist_px (closer passage)
+            if ev["min_dist_px"] < merged[-1]["min_dist_px"]:
+                merged[-1] = ev
+    return merged
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Proximity method
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -245,9 +267,26 @@ def detect_gates_proximity(
     events = []
     for gid, raw in signals.items():
         arr = _interpolate_nans(raw, max_gap=5)
-        valid_count = np.sum(~np.isnan(arr))
-        if valid_count < 10:   # need at least 10 valid frames to detect a passage
+        
+        #valid_count = np.sum(~np.isnan(arr))
+        #if valid_count < 10:   # need at least 10 valid frames to detect a passage
+        #    continue
+        
+        valid_mask = ~np.isnan(arr)
+
+        max_run = 0
+        current_run = 0
+
+        for is_valid in valid_mask:
+            if is_valid:
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 0
+
+        if max_run < 20:
             continue
+        
         arr = np.where(np.isnan(arr), np.nanmax(arr) * 2, arr)
         smoothed = gaussian_filter1d(arr, sigma=PROX_SIGMA)
         peaks, props = find_peaks(-smoothed, distance=refractory, prominence=PROX_PROMINENCE)
@@ -274,6 +313,8 @@ def detect_gates_proximity(
             if len(valid) else f"    {gid:12s}  frames={cnt:4d}  ALL NaN")
     print(f"  [DEBUG] Total events before return: {len(events)}")
 # ── END DEBUG ──────────────────────────────────────────────────────────
+    events.sort(key=lambda e: e["frame"])
+    events = deduplicate_events(events, fps, min_sep_s=0.5)
     return events
 
 
