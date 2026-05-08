@@ -52,7 +52,7 @@ FPS            = 30
 
 # ── Inference constants ───────────────────────────────────────────────────────
 POSE_CONF      = 0.35
-GATE_CONF      = 0.35
+GATE_CONF      = 0.6
 MIN_KP_CONF    = 0.20    # keypoints below this are ignored in proximity calc
 
 # Kalman gate tracker constants
@@ -298,6 +298,15 @@ def detect_gates_proximity(
             })
 
     events.sort(key=lambda e: e["frame"])
+     # Deduplicate: if multiple gate IDs fire on the same frame, keep only the
+     ## one with the smallest min_dist_px (closest approach).
+    seen_frames: dict[int, dict] = {}
+    for ev in events:
+        f = ev["frame"]
+        if f not in seen_frames or ev["min_dist_px"] < seen_frames[f]["min_dist_px"]:
+            seen_frames[f] = ev
+            events = [seen_frames[f] for f in sorted(seen_frames)]
+
     # ── DEBUG ──────────────────────────────────────────────────────────────
     print(f"\n  [DEBUG] Unique gate IDs tracked: {len(all_gate_ids)}")
     gate_detection_counts = {}
@@ -313,8 +322,8 @@ def detect_gates_proximity(
             if len(valid) else f"    {gid:12s}  frames={cnt:4d}  ALL NaN")
     print(f"  [DEBUG] Total events before return: {len(events)}")
 # ── END DEBUG ──────────────────────────────────────────────────────────
-    events.sort(key=lambda e: e["frame"])
-    events = deduplicate_events(events, fps, min_sep_s=0.5)
+    #events.sort(key=lambda e: e["frame"])
+    #events = deduplicate_events(events, fps, min_sep_s=0.5)
     return events
 
 
