@@ -284,7 +284,7 @@ def detect_gates_proximity(
             else:
                 current_run = 0
 
-        if max_run < 20:
+        if max_run < 10:
             continue
         
         arr = np.where(np.isnan(arr), np.nanmax(arr) * 2, arr)
