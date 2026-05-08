@@ -265,7 +265,8 @@ class GateDetector:
             gid: {
                 "cx":    int(trk.last_cx),
                 "cy":    int(trk.last_cy),
-                "bbox":  _predicted_bbox(trk.kf, trk.last_w, trk.last_h),
+                "bbox":  (int(trk.last_cx - trk.last_w/2), int(trk.last_cy - trk.last_h/2),
+                          int(trk.last_cx + trk.last_w/2), int(trk.last_cy + trk.last_h/2)),
                 "class": trk.cls,
                 "label": CLASS_NAMES[trk.cls],
                 "conf":  trk.last_conf,

@@ -276,7 +276,7 @@ def process(
     gate_conf:      float = 0.45,
     refractory_s:   float = 0.35,
     sigma:          float = 2.0,
-    min_prominence: float = 0.06,
+    min_prominence: float = 0.1,
     device:         str   = "",
     debug_dir:      Optional[str] = None,
 ) -> dict:
@@ -536,7 +536,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Min seconds between two passages of the same gate")
     p.add_argument("--sigma",      type=float, default=2.0,
                    help="Gaussian smoothing σ (frames) for distance signal")
-    p.add_argument("--min-prom",   type=float, default=0.06,
+    p.add_argument("--min-prom",   type=float, default=0.1,
                    help="Min prominence for normalized distance signal; try 0.04–0.08")
 
     p.add_argument("--device",     default="",
